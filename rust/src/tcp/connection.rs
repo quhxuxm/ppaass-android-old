@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fmt::Debug,
     net::{IpAddr, SocketAddr},
     os::fd::AsRawFd,
@@ -105,15 +104,20 @@ impl TcpConnection {
                 },
             };
 
-            let mut tcb = self.tcb.lock().await;
-            debug!(
-                ">>>> Tcp connection [{}] receive: {tcp_header:?}, payload size: {}, current tcb: {tcb:?}",
-                self.id,
-                payload.len()
-            );
-            match tcb.status {
+            let tcp_connection_status = {
+                let tcb = self.tcb.lock().await;
+                debug!(
+                    ">>>> Tcp connection [{}] receive: {tcp_header:?}, payload size: {}, current tcb: {:?}",
+                    self.id,
+                    payload.len(),
+                    &tcb
+                );
+                tcb.status
+            };
+
+            match tcp_connection_status {
                 TcpConnectionStatus::Listen => {
-                    Self::on_listen(self.id, &mut tcb, &self.ip_packet_output_sender, tcp_header).await?;
+                    Self::on_listen(self.id, self.tcb.clone(), &self.ip_packet_output_sender, tcp_header).await?;
                     continue;
                 },
                 TcpConnectionStatus::SynReceived => {
@@ -124,7 +128,7 @@ impl TcpConnection {
                 TcpConnectionStatus::Established => {
                     Self::on_established(
                         self.id,
-                        &mut tcb,
+                        self.tcb.clone(),
                         &self.ip_packet_output_sender,
                         self.dst_write.as_mut().ok_or(anyhow!(
                             ">>>> Tcp connection [{}] can not handle established status because of no destination write.",
@@ -140,23 +144,23 @@ impl TcpConnection {
                     return Err(anyhow!("Tcp connection [{}] in Closed status should not handle any tcp packet.", self.id));
                 },
                 TcpConnectionStatus::FinWait1 => {
-                    Self::on_fin_wait1(self.id, &mut tcb, &self.ip_packet_output_sender, tcp_header).await?;
+                    Self::on_fin_wait1(self.id, self.tcb.clone(), &self.ip_packet_output_sender, tcp_header).await?;
                     continue;
                 },
                 TcpConnectionStatus::FinWait2 => {
-                    Self::on_fin_wait2(self.id, &mut tcb, self.tcb.clone(), &self.ip_packet_output_sender, tcp_header).await?;
+                    Self::on_fin_wait2(self.id, self.tcb.clone(), &self.ip_packet_output_sender, tcp_header).await?;
                     continue;
                 },
                 TcpConnectionStatus::CloseWait => {
-                    Self::on_close_wait(self.id, &mut tcb, &self.ip_packet_output_sender, tcp_header).await?;
+                    Self::on_close_wait(self.id, self.tcb.clone(), &self.ip_packet_output_sender, tcp_header).await?;
                     continue;
                 },
                 TcpConnectionStatus::LastAck => {
-                    Self::on_last_ack(self.id, &mut tcb, &self.ip_packet_output_sender, tcp_header).await?;
+                    Self::on_last_ack(self.id, self.tcb.clone(), &self.ip_packet_output_sender, tcp_header).await?;
                     continue;
                 },
                 TcpConnectionStatus::TimeWait => {
-                    Self::on_time_wait(self.id, &mut tcb, &self.ip_packet_output_sender, tcp_header).await?;
+                    Self::on_time_wait(self.id, self.tcb.clone(), &self.ip_packet_output_sender, tcp_header).await?;
                     continue;
                 },
             }
@@ -165,8 +169,9 @@ impl TcpConnection {
     }
 
     async fn on_listen(
-        id: TcpConnectionId, tcb: &mut TransmissionControlBlock, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
+        id: TcpConnectionId, tcb: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
+        let mut tcb = tcb.lock().await;
         if !tcp_header.syn {
             error!(
                 ">>>> Tcp connection [{}] fail to process [Listen], expect syn=true, but get: {tcp_header:?}",
@@ -208,6 +213,7 @@ impl TcpConnection {
         }
         // Process the connection when the connection in SynReceived status
 
+        let mut tcb = tbc.lock().await;
         if tcp_header.acknowledgment_number != tcb.sequence_number + 1 {
             error!(
                 ">>>> Tcp connection [{id}] fail to process [SynReceived], expect sequence number={}, but get: {tcp_header:?}",
@@ -240,10 +246,11 @@ impl TcpConnection {
     }
 
     async fn on_established(
-        id: TcpConnectionId, tcb: &mut TransmissionControlBlock, ip_packet_output_sender: &Sender<Vec<u8>>, dst_write: &mut OwnedWriteHalf,
+        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, dst_write: &mut OwnedWriteHalf,
         tcp_header: TcpHeader, payload: Vec<u8>,
     ) -> Result<()> {
         // Process the connection when the connection in Established status
+        let mut tcb = tbc.lock().await;
         if tcb.sequence_number < tcp_header.acknowledgment_number {
             error!(
                 ">>>> Tcp connection [{id}] fail to process [Established], expect sequence number: {}, but get: {tcp_header:?}",
@@ -332,8 +339,9 @@ impl TcpConnection {
     }
 
     async fn on_fin_wait1(
-        id: TcpConnectionId, tcb: &mut TransmissionControlBlock, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
+        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
+        let mut tcb = tbc.lock().await;
         if !tcp_header.ack {
             error!(">>>> Tcp connection [{id}] fail to process [FinWait1], expect ack=true, but get: {tcp_header:?}",);
             return Err(anyhow!(
@@ -369,9 +377,10 @@ impl TcpConnection {
     }
 
     async fn on_fin_wait2(
-        id: TcpConnectionId, tcb: &mut TransmissionControlBlock, owned_tcb: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>,
-        tcp_header: TcpHeader,
+        id: TcpConnectionId, tcb: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
+        let tcb_for_time_wait = tcb.clone();
+        let mut tcb = tcb.lock().await;
         if !tcp_header.fin {
             error!(">>>> Tcp connection [{id}] fail to process [FinWait2], expect fin=true, but get: {tcp_header:?}",);
             return Err(anyhow!(
@@ -409,7 +418,7 @@ impl TcpConnection {
 
         tokio::spawn(async move {
             debug!(">>>> Tcp connection [{id}] in TimeWait status begin 2ML task.");
-            let mut tcb = owned_tcb.lock().await;
+            let mut tcb = tcb_for_time_wait.lock().await;
             debug!(">>>> Tcp connection [{id}] in TimeWait status doing 2ML task, current connection: {tcb:?}",);
             tcb.status = TcpConnectionStatus::Closed;
             debug!(">>>> Tcp connection [{id}] complete 2ML task switch to [Closed], current tcb: {tcb:?}",);
@@ -422,8 +431,9 @@ impl TcpConnection {
     }
 
     async fn on_last_ack(
-        id: TcpConnectionId, tcb: &mut TransmissionControlBlock, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
+        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
+        let mut tcb = tbc.lock().await;
         if !tcp_header.ack {
             error!(">>>> Tcp connection [{id}] fail to process [LastAck], expect ack=true, but get: {tcp_header:?}",);
             return Err(anyhow!(
@@ -456,16 +466,18 @@ impl TcpConnection {
     }
 
     async fn on_time_wait(
-        id: TcpConnectionId, tcb: &mut TransmissionControlBlock, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
+        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
+        let tcb = tbc.lock().await;
         Self::send_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, ip_packet_output_sender, None).await?;
         debug!(">>>> Tcp connection [{id}] keep in [TimeWait], current tcb: {tcb:?}");
         Ok(())
     }
 
     async fn on_close_wait(
-        id: TcpConnectionId, tcb: &mut TransmissionControlBlock, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
+        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
+        let mut tcb = tbc.lock().await;
         debug!(">>>> Tcp connection [{id}] in [CloseWait] status, switch to [LastAck], current tcb: {tcb:?}");
         Self::send_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, ip_packet_output_sender, None).await?;
         tcb.status = TcpConnectionStatus::LastAck;
@@ -474,7 +486,7 @@ impl TcpConnection {
     }
 
     async fn start_dst_relay(
-        id: TcpConnectionId, ip_packet_output_sender: Sender<Vec<u8>>, mut dst_read: OwnedReadHalf, owned_tcb: Arc<Mutex<TransmissionControlBlock>>,
+        id: TcpConnectionId, ip_packet_output_sender: Sender<Vec<u8>>, mut dst_read: OwnedReadHalf, tcb: Arc<Mutex<TransmissionControlBlock>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -482,7 +494,7 @@ impl TcpConnection {
                 let dst_read_buf = match dst_read.read(&mut dst_read_buf).await {
                     Ok(0) => {
                         // Close the connection activally when read destination complete
-                        let mut tcb = owned_tcb.lock().await;
+                        let mut tcb = tcb.lock().await;
                         debug!("<<<< Tcp connection [{id}] read destination data complete send fin to tun, current tcb:{tcb:?}");
                         if let Err(e) = Self::send_fin_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, &ip_packet_output_sender).await {
                             error!("<<<< Tcp connection [{id}] fail to send fin ack packet to tun because of error: {e:?}");
@@ -498,7 +510,7 @@ impl TcpConnection {
                         break;
                     },
                 };
-                let mut tcb = owned_tcb.lock().await;
+                let mut tcb = tcb.lock().await;
                 let destination_read_data_size: u32 = match dst_read_buf.len().try_into() {
                     Ok(size) => size,
                     Err(e) => {
