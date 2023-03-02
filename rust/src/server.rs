@@ -26,7 +26,7 @@ use tokio::{runtime::Runtime as TokioRuntime, sync::Mutex};
 use uuid::Uuid;
 
 use crate::{
-    tcp::{TcpConnection, TcpConnectionKey, TcpConnectionTunHandle},
+    tcp::{TcpConnection, TcpConnectionId, TcpConnectionTcpPacketInputHandle},
     udp::{handle_udp_packet, UdpPacketInfo},
 };
 
@@ -34,7 +34,7 @@ pub(crate) struct PpaassVpnServer {
     id: String,
     runtime: Option<TokioRuntime>,
     tun_fd: i32,
-    tcp_connection_tun_handle_repository: Arc<Mutex<HashMap<TcpConnectionKey, TcpConnectionTunHandle>>>,
+    tcp_connection_tun_handle_repository: Arc<Mutex<HashMap<TcpConnectionId, TcpConnectionTcpPacketInputHandle>>>,
 }
 
 impl Debug for PpaassVpnServer {
@@ -62,7 +62,7 @@ impl PpaassVpnServer {
             id,
             runtime: Some(runtime),
             tun_fd,
-            tcp_connection_tun_handle_repository: Arc::new(Mutex::new(HashMap::<TcpConnectionKey, TcpConnectionTunHandle>::new())),
+            tcp_connection_tun_handle_repository: Arc::new(Mutex::new(HashMap::<TcpConnectionId, TcpConnectionTcpPacketInputHandle>::new())),
         })
     }
 
@@ -194,7 +194,7 @@ impl PpaassVpnServer {
                             continue;
                         },
                         Tcp(tcp_header) => {
-                            let tcp_connection_key = TcpConnectionKey::new(
+                            let tcp_connection_id = TcpConnectionId::new(
                                 ipv4_header.source_addr(),
                                 tcp_header.source_port(),
                                 ipv4_header.destination_addr(),
@@ -202,30 +202,29 @@ impl PpaassVpnServer {
                             );
 
                             let mut tcp_connection_handle_repository_lock = tcp_connection_handle_repository.lock().await;
-                            let tcp_connection_handle = match tcp_connection_handle_repository_lock.entry(tcp_connection_key) {
+                            let tcp_connection_handle = match tcp_connection_handle_repository_lock.entry(tcp_connection_id) {
                                 Occupied(entry) => {
-                                    trace!(">>>> Get existing tcp connection [{tcp_connection_key}]");
+                                    trace!(">>>> Get existing tcp connection [{tcp_connection_id}]");
                                     entry.into_mut()
                                 },
                                 Vacant(entry) => {
-                                    trace!(">>>> Create new tcp connection [{tcp_connection_key}]");
-                                    let mut tcp_connection =
-                                        TcpConnection::new(tcp_connection_key, tun_write_sender.clone(), tcp_connection_handle_repository.clone());
-                                    let handle = entry.insert(tcp_connection.clone_tun_handle());
+                                    trace!(">>>> Create new tcp connection [{tcp_connection_id}]");
+                                    let mut tcp_connection = TcpConnection::new(tcp_connection_id, tun_write_sender.clone());
+                                    let handle = entry.insert(tcp_connection.clone_input_handle());
                                     let tcp_connection_handle_repository = tcp_connection_handle_repository.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) = tcp_connection.process().await {
-                                            error!(">>>> Fail to process tcp connection [{tcp_connection_key}] because of error: {e:?}");
-                                            let mut tcp_connection_handle_repository_lock = tcp_connection_handle_repository.lock().await;
-                                            tcp_connection_handle_repository_lock.remove(&tcp_connection_key);
+                                            error!(">>>> Fail to process tcp connection [{tcp_connection_id}] because of error: {e:?}");
                                         }
+                                        let mut tcp_connection_handle_repository = tcp_connection_handle_repository.lock().await;
+                                        tcp_connection_handle_repository.remove(&tcp_connection_id);
                                     });
                                     handle
                                 },
                             };
                             if let Err(e) = tcp_connection_handle.handle_tun_input(tcp_header.to_header(), ip_packet.payload).await {
-                                error!(">>>> Tcp connection [{tcp_connection_key}] fail to handle tun input because of error: {e:?}");
-                                tcp_connection_handle_repository_lock.remove(&tcp_connection_key);
+                                error!(">>>> Tcp connection [{tcp_connection_id}] fail to handle tun input because of error: {e:?}");
+                                tcp_connection_handle_repository_lock.remove(&tcp_connection_id);
                             };
                         },
                         Unknown(unknown_protocol) => {

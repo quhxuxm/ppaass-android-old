@@ -6,17 +6,17 @@ use std::{
 mod connection;
 
 pub(crate) use connection::TcpConnection;
-pub(crate) use connection::TcpConnectionTunHandle;
+pub(crate) use connection::TcpConnectionTcpPacketInputHandle;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct TcpConnectionKey {
+pub(crate) struct TcpConnectionId {
     src_addr: Ipv4Addr,
     dst_addr: Ipv4Addr,
     src_port: u16,
     dst_port: u16,
 }
 
-impl TcpConnectionKey {
+impl TcpConnectionId {
     pub(crate) fn new(src_addr: Ipv4Addr, src_port: u16, dst_addr: Ipv4Addr, dst_port: u16) -> Self {
         Self {
             src_addr,
@@ -27,13 +27,13 @@ impl TcpConnectionKey {
     }
 }
 
-impl Debug for TcpConnectionKey {
+impl Debug for TcpConnectionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}:{}->{}:{}]", self.src_addr, self.src_port, self.dst_addr, self.dst_port)
     }
 }
 
-impl Display for TcpConnectionKey {
+impl Display for TcpConnectionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
     }
@@ -71,7 +71,7 @@ impl Display for TcpConnectionStatus {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct TransmissionControlBlock {
     pub sequence_number: u32,
     pub acknowledgment_number: u32,
