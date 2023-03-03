@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::protect_socket;
+use crate::{protect_socket, tcp};
 
 use super::{TcpConnectionId, TcpConnectionStatus, TransmissionControlBlock};
 use anyhow::{anyhow, Result};
@@ -26,6 +26,7 @@ use tokio::{
 };
 
 const IP_PACKET_TTL: u8 = 64;
+const MAX_TCP_PACKET_PAYLOAD_SIZE: usize = 1460;
 const WINDOW_SIZE: u16 = 65535;
 const CONNECT_TO_DST_TIMEOUT: u64 = 20;
 
@@ -99,7 +100,7 @@ impl TcpConnection {
             let (tcp_header, payload) = match self.tcp_packet_input_receiver.recv().await {
                 Some(value) => value,
                 None => {
-                    debug!(">>>> Tcp connection [{}] read all tun input.", self.id);
+                    debug!(">>>> Tcp connection [{}] complete to read tun data.", self.id);
                     break;
                 },
             };
@@ -107,7 +108,7 @@ impl TcpConnection {
             let tcp_connection_status = {
                 let tcb = self.tcb.lock().await;
                 debug!(
-                    ">>>> Tcp connection [{}] receive: {tcp_header:?}, payload size: {}, current tcb: {:?}",
+                    ">>>> Tcp connection [{}] receive: {tcp_header:?}, payload size={}, current tcb: {:?}",
                     self.id,
                     payload.len(),
                     &tcb
@@ -251,7 +252,7 @@ impl TcpConnection {
     ) -> Result<()> {
         // Process the connection when the connection in Established status
         let mut tcb = tbc.lock().await;
-        if tcb.sequence_number < tcp_header.acknowledgment_number {
+        if tcb.sequence_number != tcp_header.acknowledgment_number {
             error!(
                 ">>>> Tcp connection [{id}] fail to process [Established], expect sequence number: {}, but get: {tcp_header:?}",
                 tcb.sequence_number
@@ -263,7 +264,7 @@ impl TcpConnection {
             ));
         }
 
-        if tcb.acknowledgment_number > tcp_header.sequence_number {
+        if tcb.acknowledgment_number != tcp_header.sequence_number {
             error!(
                 ">>>> Tcp connection [{id}] fail to process [Established], expect acknowledgment number: {}, but get: {tcp_header:?}",
                 tcb.acknowledgment_number
@@ -298,7 +299,7 @@ impl TcpConnection {
                 ));
             };
 
-            trace!(
+            debug!(
                 ">>>> Tcp connection [{id}] success relay tun data [size={}] to destination:\n{}\n",
                 relay_data_length,
                 pretty_hex::pretty_hex(&payload)
@@ -326,14 +327,14 @@ impl TcpConnection {
             return Ok(());
         }
 
-        Self::send_ack_to_tun(
-            id,
-            tcb.sequence_number,
-            tcp_header.sequence_number + relay_data_length,
-            ip_packet_output_sender,
-            None,
-        )
-        .await?;
+        // Self::send_ack_to_tun(
+        //     id,
+        //     tcb.sequence_number,
+        //     tcp_header.sequence_number + relay_data_length,
+        //     ip_packet_output_sender,
+        //     None,
+        // )
+        // .await?;
         tcb.acknowledgment_number = tcp_header.sequence_number + relay_data_length;
         Ok(())
     }
@@ -490,44 +491,42 @@ impl TcpConnection {
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let mut dst_read_buf = [0u8; 65535];
-                let dst_read_buf = match dst_read.read(&mut dst_read_buf).await {
+                let mut tcb = tcb.lock().await;
+                debug!(
+                    "<<<< Tcp connection [{id}] relay destination data to tun, before current read: sequence_number={}, acknowledgment_number={}",
+                    tcb.sequence_number, tcb.acknowledgment_number,
+                );
+                let mut dst_data = [0u8; MAX_TCP_PACKET_PAYLOAD_SIZE];
+                let size = match dst_read.read(&mut dst_data).await {
                     Ok(0) => {
                         // Close the connection activally when read destination complete
-                        let mut tcb = tcb.lock().await;
                         debug!("<<<< Tcp connection [{id}] read destination data complete send fin to tun, current tcb:{tcb:?}");
                         if let Err(e) = Self::send_fin_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, &ip_packet_output_sender).await {
                             error!("<<<< Tcp connection [{id}] fail to send fin ack packet to tun because of error: {e:?}");
-                            break;
+                            return;
                         };
                         tcb.status = TcpConnectionStatus::FinWait1;
                         tcb.sequence_number += 1;
                         return;
                     },
-                    Ok(size) => &dst_read_buf[0..size],
-                    Err(e) => {
-                        error!("<<<< Tcp connection [{id}] fail to read destination data because of error: {e:?}");
-                        break;
-                    },
-                };
-                let mut tcb = tcb.lock().await;
-                let destination_read_data_size: u32 = match dst_read_buf.len().try_into() {
                     Ok(size) => size,
                     Err(e) => {
-                        error!("<<<< Tcp connection [{id}] fail to convert destination read data size because of error: {e:?}");
-
-                        break;
+                        error!("<<<< Tcp connection [{id}] fail to read destination data because of error: {e:?}");
+                        return;
                     },
                 };
-                tcb.sequence_number += destination_read_data_size;
-
-                if let Err(e) = Self::send_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, &ip_packet_output_sender, Some(dst_read_buf)).await {
+                let dst_data = &dst_data[..size];
+                tcb.sequence_number += size as u32;
+                if let Err(e) = Self::send_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, &ip_packet_output_sender, Some(dst_data)).await {
                     error!("<<<< Tcp connection [{id}] fail to generate ip packet write to tun device because of error: {e:?}");
-                    continue;
+                    return;
                 };
-                trace!(
-                    "<<<< Tcp connection [{id}] success relay destination data to tun:\n{}\n",
-                    pretty_hex::pretty_hex(&dst_read_buf)
+                debug!(
+                    "<<<< Tcp connection [{id}] success relay destination data to tun, payload size={}, sequence_number={}, acknowledgment_number={}:\n{}\n",
+                    size,
+                    tcb.sequence_number,
+                    tcb.acknowledgment_number,
+                    pretty_hex::pretty_hex(&dst_data)
                 );
             }
         })
@@ -553,7 +552,7 @@ impl TcpConnection {
         ip_packet.write(&mut ip_packet_bytes, payload)?;
         ip_packet_output_sender.send(ip_packet_bytes).await?;
         debug!(
-            "<<<< Tcp connection [{id}] send ack to device, payload size: {}, sequence_number={sequence_number}, acknowledgment_number={acknowledgment_number}",
+            "<<<< Tcp connection [{id}] send ack to device, payload size={}, sequence_number={sequence_number}, acknowledgment_number={acknowledgment_number}",
             payload.len()
         );
         Ok(())
