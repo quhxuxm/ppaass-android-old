@@ -251,7 +251,7 @@ impl TcpConnection {
         // Process the connection when the connection in Established status
         let mut tcb = tbc.lock().await;
 
-        if tcb.sequence_number != tcp_header.acknowledgment_number {
+        if tcb.sequence_number < tcp_header.acknowledgment_number {
             error!(
                 ">>>> Tcp connection [{id}] fail to process [Established] because of unexpected sequence number, {}",
                 &tcb
@@ -262,7 +262,7 @@ impl TcpConnection {
             ));
         }
 
-        if tcb.acknowledgment_number != tcp_header.sequence_number {
+        if tcb.acknowledgment_number > tcp_header.sequence_number {
             error!(
                 ">>>> Tcp connection [{id}] fail to process [Established] because of unexpected acknowledgment number, {}",
                 &tcb
@@ -327,15 +327,14 @@ impl TcpConnection {
             Self::send_fin_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, ip_packet_output_sender).await?;
             return Ok(());
         }
-
-        // Self::send_ack_to_tun(
-        //     id,
-        //     tcb.sequence_number,
-        //     tcp_header.sequence_number + relay_data_length,
-        //     ip_packet_output_sender,
-        //     None,
-        // )
-        // .await?;
+        Self::send_ack_to_tun(
+            id,
+            tcb.sequence_number,
+            tcp_header.sequence_number + relay_data_length,
+            ip_packet_output_sender,
+            None,
+        )
+        .await?;
         tcb.acknowledgment_number = tcp_header.sequence_number + relay_data_length;
         Ok(())
     }
