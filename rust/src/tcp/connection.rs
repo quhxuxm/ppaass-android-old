@@ -87,10 +87,11 @@ impl TcpConnection {
         if let Err(e) = self.concrete_process().await {
             let tcb = self.tcb.lock().await;
             error!(
-                "<<<< Tcp connection [{}] fail to process state machine because of error, current tcb: {tcb:?}, error: {e:?}",
+                "<<<< Tcp connection [{}] fail to process state machine because of error, {tcb:?}, error: {e:?}",
                 self.id
             );
             Self::send_rst_ack_to_tun(self.id, tcb.sequence_number, tcb.acknowledgment_number, &self.ip_packet_output_sender).await?;
+            return Err(e);
         }
         Ok(())
     }
@@ -105,10 +106,14 @@ impl TcpConnection {
                 },
             };
 
+            if tcp_header.rst {
+                error!(">>>> Tcp connection [{}] receive rst packet.", self.id);
+                return Err(anyhow!("Tcp connection [{}] receive rst packet.", self.id));
+            }
             let tcp_connection_status = {
                 let tcb = self.tcb.lock().await;
                 debug!(
-                    ">>>> Tcp connection [{}] receive: {tcp_header:?}, payload size={}, current tcb: {:?}",
+                    ">>>> Tcp connection [{}] receive: {tcp_header:?}, payload size={}, {}",
                     self.id,
                     payload.len(),
                     &tcb
@@ -174,25 +179,18 @@ impl TcpConnection {
     ) -> Result<()> {
         let mut tcb = tcb.lock().await;
         if !tcp_header.syn {
-            error!(
-                ">>>> Tcp connection [{}] fail to process [Listen], expect syn=true, but get: {tcp_header:?}",
-                id
-            );
-            return Err(anyhow!(
-                "Tcp connection [{}] fail to process [Listen], expect syn=true, but get: {tcp_header:?}",
-                id
-            ));
+            error!(">>>> Tcp connection [{id}] fail to process [Listen] because of not a syn packet, {}", &tcb);
+            return Err(anyhow!("Tcp connection [{id}] fail to process [Listen] because of not a syn packet, {}", &tcb));
         }
 
         let iss = random::<u32>();
-
         tcb.status = TcpConnectionStatus::SynReceived;
-
         tcb.sequence_number = iss;
-
-        Self::send_syn_ack_to_tun(id, tcb.sequence_number, tcp_header.sequence_number + 1, ip_packet_output_sender).await?;
-
-        debug!("<<<< Tcp connection [{id}] switch to [SynReceived], current tcb: {tcb:?}",);
+        tcb.acknowledgment_number = tcp_header.sequence_number + 1;
+        tcb.initial_sequence_number = iss;
+        tcb.initial_acknowledgement_number = tcp_header.sequence_number + 1;
+        Self::send_syn_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, ip_packet_output_sender).await?;
+        debug!("<<<< Tcp connection [{id}] switch to [SynReceived], {}", &tcb);
         Ok(())
     }
 
@@ -200,16 +198,16 @@ impl TcpConnection {
         id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<OwnedWriteHalf> {
         if tcp_header.syn {
-            error!(">>>> Tcp connection [{id}] fail to process [SynReceived], expect syn=false, but get: {tcp_header:?}",);
+            error!(">>>> Tcp connection [{id}] fail to process [SynReceived] because of incoming packet is a syn packet",);
             return Err(anyhow!(
-                "Tcp connection [{id}] fail to process [SynReceived], expect syn=false, but get: {tcp_header:?}",
+                "Tcp connection [{id}] fail to process [SynReceived] because of incoming packet is a syn packet",
             ));
         }
         if !tcp_header.ack {
             // In SynReceived status, connection should receive a ack.
-            error!(">>>> Tcp connection [{id}] fail to process [SynReceived], expect ack=true, but get: {tcp_header:?}",);
+            error!(">>>> Tcp connection [{id}] fail to process [SynReceived] because of incoming packet is not a ack packet",);
             return Err(anyhow!(
-                "Tcp connection [{id}] fail to process [SynReceived], expect ack=true, but get: {tcp_header:?}",
+                "Tcp connection [{id}] fail to process [SynReceived] because of incoming packet is not a ack packet",
             ));
         }
         // Process the connection when the connection in SynReceived status
@@ -217,12 +215,12 @@ impl TcpConnection {
         let mut tcb = tbc.lock().await;
         if tcp_header.acknowledgment_number != tcb.sequence_number + 1 {
             error!(
-                ">>>> Tcp connection [{id}] fail to process [SynReceived], expect sequence number={}, but get: {tcp_header:?}",
-                tcb.sequence_number + 1
+                ">>>> Tcp connection [{id}] fail to process [SynReceived] because of un expected sequence number, {}",
+                &tcb
             );
             return Err(anyhow!(
-                "Tcp connection [{id}] fail to process [SynReceived], expect sequence number={}, but get: {tcp_header:?}",
-                tcb.sequence_number + 1,
+                "Tcp connection [{id}] fail to process [SynReceived] because of un expected sequence number, {}",
+                &tcb
             ));
         }
 
@@ -232,7 +230,7 @@ impl TcpConnection {
         let dst_socket_addr = SocketAddr::new(IpAddr::V4(id.dst_addr), id.dst_port);
         let dst_tcp_stream = timeout(Duration::from_secs(CONNECT_TO_DST_TIMEOUT), dst_socket.connect(dst_socket_addr)).await??;
 
-        debug!(">>>> Tcp connection [{}] connect to destination success.", id);
+        debug!(">>>> Tcp connection [{}] connect to destination success, {}", id, &tcb);
         let (dst_read, dst_write) = dst_tcp_stream.into_split();
 
         Self::start_dst_relay(id, ip_packet_output_sender.clone(), dst_read, tbc.clone()).await;
@@ -242,7 +240,7 @@ impl TcpConnection {
         tcb.sequence_number += 1;
         tcb.acknowledgment_number = tcp_header.sequence_number;
 
-        debug!(">>>> Tcp connection [{id}] switch to [Established], current tcb: {tcb:?}",);
+        debug!(">>>> Tcp connection [{id}] switch to [Established], {}", &tcb);
         Ok(dst_write)
     }
 
@@ -252,27 +250,26 @@ impl TcpConnection {
     ) -> Result<()> {
         // Process the connection when the connection in Established status
         let mut tcb = tbc.lock().await;
+
         if tcb.sequence_number != tcp_header.acknowledgment_number {
             error!(
-                ">>>> Tcp connection [{id}] fail to process [Established], expect sequence number: {}, but get: {tcp_header:?}",
-                tcb.sequence_number
+                ">>>> Tcp connection [{id}] fail to process [Established] because of unexpected sequence number, {}",
+                &tcb
             );
-
             return Err(anyhow!(
-                "Tcp connection [{id}] fail to process [Established], expect sequence number: {}, but get: {tcp_header:?}",
-                tcb.sequence_number
+                "Tcp connection [{id}] fail to process [Established] because of unexpected sequence number, {}",
+                &tcb
             ));
         }
 
         if tcb.acknowledgment_number != tcp_header.sequence_number {
             error!(
-                ">>>> Tcp connection [{id}] fail to process [Established], expect acknowledgment number: {}, but get: {tcp_header:?}",
-                tcb.acknowledgment_number
+                ">>>> Tcp connection [{id}] fail to process [Established] because of unexpected acknowledgment number, {}",
+                &tcb
             );
-
             return Err(anyhow!(
-                "Tcp connection [{id}] fail to process [Established], expect acknowledgment number: {}, but get: {tcp_header:?}",
-                tcb.acknowledgment_number
+                "Tcp connection [{id}] fail to process [Established] because of unexpected acknowledgment number, {}",
+                &tcb
             ));
         }
 
@@ -300,8 +297,9 @@ impl TcpConnection {
             };
 
             debug!(
-                ">>>> Tcp connection [{id}] success relay tun data [size={}] to destination:\n{}\n",
+                ">>>> Tcp connection [{id}] success relay tun data [size={}] to destination, {}, tun data:\n{}\n",
                 relay_data_length,
+                &tcb,
                 pretty_hex::pretty_hex(&payload)
             );
         }
@@ -309,7 +307,10 @@ impl TcpConnection {
         if tcp_header.fin {
             tcb.status = TcpConnectionStatus::CloseWait;
 
-            debug!(">>>> Tcp connection [{id}] in [Established] status, receive FIN, switch to [CloseWait], current tcb: {tcb:?}",);
+            debug!(
+                ">>>> Tcp connection [{id}] in [Established] status, receive FIN, switch to [CloseWait], {}",
+                &tcb
+            );
             Self::send_ack_to_tun(
                 id,
                 tcb.sequence_number,
@@ -322,7 +323,7 @@ impl TcpConnection {
 
             tcb.status = TcpConnectionStatus::LastAck;
 
-            debug!(">>>> Tcp connection [{id}] in [CloseWait] status, switch to [LastAck], current tcb: {tcb:?}",);
+            debug!(">>>> Tcp connection [{id}] in [CloseWait] status, switch to [LastAck], {}", &tcb);
             Self::send_fin_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, ip_packet_output_sender).await?;
             return Ok(());
         }
@@ -492,15 +493,11 @@ impl TcpConnection {
         tokio::spawn(async move {
             loop {
                 let mut tcb = tcb.lock().await;
-                debug!(
-                    "<<<< Tcp connection [{id}] relay destination data to tun, before current read: sequence_number={}, acknowledgment_number={}",
-                    tcb.sequence_number, tcb.acknowledgment_number,
-                );
                 let mut dst_data = [0u8; MAX_TCP_PACKET_PAYLOAD_SIZE];
                 let size = match dst_read.read(&mut dst_data).await {
                     Ok(0) => {
                         // Close the connection activally when read destination complete
-                        debug!("<<<< Tcp connection [{id}] read destination data complete send fin to tun, current tcb:{tcb:?}");
+                        debug!("<<<< Tcp connection [{id}] read destination data complete, {tcb:?}");
                         if let Err(e) = Self::send_fin_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, &ip_packet_output_sender).await {
                             error!("<<<< Tcp connection [{id}] fail to send fin ack packet to tun because of error: {e:?}");
                             return;
@@ -522,10 +519,9 @@ impl TcpConnection {
                     return;
                 };
                 debug!(
-                    "<<<< Tcp connection [{id}] success relay destination data to tun, payload size={}, sequence_number={}, acknowledgment_number={}:\n{}\n",
+                    "<<<< Tcp connection [{id}] success relay destination data to tun, payload size={},{}, destination payload:\n{}\n",
                     size,
-                    tcb.sequence_number,
-                    tcb.acknowledgment_number,
+                    &tcb,
                     pretty_hex::pretty_hex(&dst_data)
                 );
             }

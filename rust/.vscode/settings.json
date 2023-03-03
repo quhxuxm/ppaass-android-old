@@ -1,5 +1,8 @@
 {
     "yaml.schemas": {
-        "https://json.schemastore.org/catalog-info.json": "untitled:Untitled-2"
+        "https://json.schemastore.org/catalog-info.json": [
+            "untitled:Untitled-2",
+            "untitled:Untitled-1"
+        ]
     }
 }

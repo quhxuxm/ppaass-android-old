@@ -71,9 +71,32 @@ impl Display for TcpConnectionStatus {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 struct TransmissionControlBlock {
+    pub initial_sequence_number: u32,
+    pub initial_acknowledgement_number: u32,
     pub sequence_number: u32,
     pub acknowledgment_number: u32,
     pub status: TcpConnectionStatus,
+}
+
+impl Debug for TransmissionControlBlock {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TCB")
+            .field("relative_sequence_number", &(self.sequence_number - self.initial_sequence_number))
+            .field(
+                "relative_acknowledgement_number",
+                &(self.acknowledgment_number - self.initial_acknowledgement_number),
+            )
+            .field("sequence_number", &self.sequence_number)
+            .field("acknowledgment_number", &self.acknowledgment_number)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+impl Display for TransmissionControlBlock {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", &self)
+    }
 }
