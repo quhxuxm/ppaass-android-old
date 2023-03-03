@@ -498,12 +498,12 @@ impl TcpConnection {
                     Ok(0) => {
                         // Close the connection activally when read destination complete
                         debug!("<<<< Tcp connection [{id}] read destination data complete, {tcb:?}");
-                        if let Err(e) = Self::send_fin_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, &ip_packet_output_sender).await {
-                            error!("<<<< Tcp connection [{id}] fail to send fin ack packet to tun because of error: {e:?}");
-                            return;
-                        };
-                        tcb.status = TcpConnectionStatus::FinWait1;
-                        tcb.sequence_number += 1;
+                        // if let Err(e) = Self::send_fin_ack_to_tun(id, tcb.sequence_number, tcb.acknowledgment_number, &ip_packet_output_sender).await {
+                        //     error!("<<<< Tcp connection [{id}] fail to send fin ack packet to tun because of error: {e:?}");
+                        //     return;
+                        // };
+                        // tcb.status = TcpConnectionStatus::FinWait1;
+                        // tcb.sequence_number += 1;
                         return;
                     },
                     Ok(size) => size,
