@@ -78,6 +78,7 @@ struct TransmissionControlBlock {
     pub sequence_number: u32,
     pub acknowledgment_number: u32,
     pub status: TcpConnectionStatus,
+    pub device_window_size: u16,
 }
 
 impl Debug for TransmissionControlBlock {
