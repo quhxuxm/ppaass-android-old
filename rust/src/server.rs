@@ -83,16 +83,16 @@ impl PpaassVpnServer {
 
         let tcp_connection_handle_repository = self.tcp_connection_tun_handle_repository.clone();
 
-        let (tun_write_sender, mut tun_write_receiver) = channel::<Vec<u8>>(1024);
+        let (device_data_write_sender, mut device_data_write_receiver) = channel::<Vec<u8>>(1024);
         let tun_fd = self.tun_fd;
-        let tun_file = Arc::new(Mutex::new(unsafe { File::from_raw_fd(tun_fd) }));
+        let device_data_file = Arc::new(Mutex::new(unsafe { File::from_raw_fd(tun_fd) }));
 
-        let tun_write = tun_file.clone();
-        let tun_read = tun_file;
+        let device_data_write = device_data_file.clone();
+        let device_data_read = device_data_file;
         runtime.block_on(async move {
-            let tun_write_guard = tokio::spawn(async move {
+            let device_data_write_guard = tokio::spawn(async move {
                 loop {
-                    let ip_packet_bytes = match tun_write_receiver.recv().await {
+                    let ip_packet_bytes = match device_data_write_receiver.recv().await {
                         Some(value) => value,
                         None => {
                             debug!("<<<< Nothing write to tun, stop wrtier task.");
@@ -103,27 +103,27 @@ impl PpaassVpnServer {
 
                     trace!("<<<< Write ip packet to tun: {ip_packet:?}");
 
-                    let mut tun_write = tun_write.lock().await;
-                    if let Err(e) = tun_write.write(&ip_packet_bytes) {
+                    let mut device_data_write = device_data_write.lock().await;
+                    if let Err(e) = device_data_write.write(&ip_packet_bytes) {
                         error!("<<<< Fail to write ip packet to tun because of error: {e:?}")
                     };
-                    if let Err(e) = tun_write.flush() {
+                    if let Err(e) = device_data_write.flush() {
                         error!("<<<< Fail to flush ip packet to tun because of error: {e:?}")
                     };
                 }
             });
-            let tun_read_guard = tokio::spawn(async move {
-                let tun_write_sender = tun_write_sender;
+            let device_data_read_guard = tokio::spawn(async move {
+                let device_data_write_sender = device_data_write_sender;
                 loop {
-                    let mut tun_read_buf = vec![0; 65535];
-                    let mut tun_read = tun_read.lock().await;
+                    let mut device_data_read_buf = vec![0; 65535];
+                    let mut device_data_read = device_data_read.lock().await;
 
-                    let tun_read_buf = match tun_read.read(&mut tun_read_buf) {
+                    let device_data_read_buf = match device_data_read.read(&mut device_data_read_buf) {
                         Ok(0) => {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             continue;
                         },
-                        Ok(size) => &tun_read_buf[..size],
+                        Ok(size) => &device_data_read_buf[..size],
                         Err(e) => {
                             if e.kind() == ErrorKind::WouldBlock {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -133,8 +133,8 @@ impl PpaassVpnServer {
                             break;
                         },
                     };
-                    drop(tun_read);
-                    let ip_packet = match etherparse::SlicedPacket::from_ip(tun_read_buf) {
+                    drop(device_data_read);
+                    let ip_packet = match etherparse::SlicedPacket::from_ip(device_data_read_buf) {
                         Ok(ip_packet) => ip_packet,
                         Err(e) => {
                             error!(">>>> Fail to read ip packet from tun because of error: {e:?}");
@@ -188,7 +188,7 @@ impl PpaassVpnServer {
                                 payload: ip_packet.payload.to_vec(),
                             };
                             let udp_packet_key = format!("{udp_packet_info}");
-                            if let Err(e) = handle_udp_packet(udp_packet_info, tun_write_sender.clone()).await {
+                            if let Err(e) = handle_udp_packet(udp_packet_info, device_data_write_sender.clone()).await {
                                 error!(">>>> Udp socket [{udp_packet_key}] fail to handle tun input because of error: {e:?}");
                             };
                             continue;
@@ -209,7 +209,7 @@ impl PpaassVpnServer {
                                 },
                                 Vacant(entry) => {
                                     debug!(">>>> Create new tcp connection [{tcp_connection_id}]");
-                                    let mut tcp_connection = TcpConnection::new(tcp_connection_id, tun_write_sender.clone());
+                                    let mut tcp_connection = TcpConnection::new(tcp_connection_id, device_data_write_sender.clone());
                                     let handle = entry.insert(tcp_connection.clone_input_handle());
                                     let tcp_connection_handle_repository = tcp_connection_handle_repository.clone();
                                     tokio::spawn(async move {
@@ -234,7 +234,7 @@ impl PpaassVpnServer {
                     }
                 }
             });
-            let _ = tokio::join!(tun_read_guard, tun_write_guard);
+            let _ = tokio::join!(device_data_read_guard, device_data_write_guard);
         });
         info!("Shutdown ppaass vpn server.");
         Ok(())

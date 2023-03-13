@@ -71,14 +71,36 @@ impl Display for TcpConnectionStatus {
     }
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone)]
+#[non_exhaustive]
 struct TransmissionControlBlock {
     pub initial_sequence_number: u32,
     pub initial_acknowledgement_number: u32,
     pub sequence_number: u32,
     pub acknowledgment_number: u32,
     pub status: TcpConnectionStatus,
-    pub device_window_size: u16,
+    pub rx_window_start: usize,
+    pub tx_window_start: usize,
+    pub rx_window_size: u16,
+    pub tx_window_size: u16,
+    pub rx_window: Vec<u8>,
+    pub tx_window: Vec<u8>,
+}
+
+impl Default for TransmissionControlBlock {
+    fn default() -> Self {
+        Self {
+            initial_sequence_number: Default::default(),
+            initial_acknowledgement_number: Default::default(),
+            sequence_number: Default::default(),
+            acknowledgment_number: Default::default(),
+            status: Default::default(),
+            rx_window: vec![0u8; u16::MAX as usize],
+            tx_window: vec![0u8; u16::MAX as usize],
+            rx_window_size: u16::MAX,
+            tx_window_size: u16::MAX,
+        }
+    }
 }
 
 impl Debug for TransmissionControlBlock {
@@ -91,6 +113,8 @@ impl Debug for TransmissionControlBlock {
             )
             .field("sequence_number", &self.sequence_number)
             .field("acknowledgment_number", &self.acknowledgment_number)
+            .field("rx_window_size", &self.rx_window_size)
+            .field("tx_window_size", &self.tx_window_size)
             .field("status", &self.status)
             .finish()
     }
