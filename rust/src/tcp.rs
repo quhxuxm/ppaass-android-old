@@ -7,6 +7,7 @@ mod connection;
 
 pub(crate) use connection::TcpConnection;
 pub(crate) use connection::TcpConnectionTcpPacketInputHandle;
+use tokio::task::JoinHandle;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TcpConnectionId {
@@ -71,7 +72,6 @@ impl Display for TcpConnectionStatus {
     }
 }
 
-#[derive(Clone)]
 #[non_exhaustive]
 struct TransmissionControlBlock {
     pub initial_sequence_number: u32,
@@ -79,12 +79,12 @@ struct TransmissionControlBlock {
     pub sequence_number: u32,
     pub acknowledgment_number: u32,
     pub status: TcpConnectionStatus,
-    pub rx_window_start: usize,
-    pub tx_window_start: usize,
     pub rx_window_size: u16,
     pub tx_window_size: u16,
     pub rx_window: Vec<u8>,
     pub tx_window: Vec<u8>,
+    pub dst_read_task: Option<JoinHandle<()>>,
+    pub dst_write_task: Option<JoinHandle<()>>,
 }
 
 impl Default for TransmissionControlBlock {
@@ -99,6 +99,8 @@ impl Default for TransmissionControlBlock {
             tx_window: vec![0u8; u16::MAX as usize],
             rx_window_size: u16::MAX,
             tx_window_size: u16::MAX,
+            dst_read_task: None,
+            dst_write_task: None,
         }
     }
 }

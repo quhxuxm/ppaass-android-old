@@ -28,8 +28,6 @@ use tokio::{
 use tokio::{io::AsyncWriteExt, sync::Notify};
 
 const IP_PACKET_TTL: u8 = 64;
-const MAX_TCP_PACKET_PAYLOAD_SIZE: usize = 1460;
-const WINDOW_SIZE: u16 = 65535;
 const CONNECT_TO_DST_TIMEOUT: u64 = 20;
 
 #[derive(Debug, Clone)]
@@ -205,7 +203,7 @@ impl TcpConnection {
     }
 
     async fn on_syn_received(
-        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, dst_read_notify: Arc<Notify>,
+        id: TcpConnectionId, tcb: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, dst_read_notify: Arc<Notify>,
         dst_write_notify: Arc<Notify>, tcp_header: TcpHeader,
     ) -> Result<()> {
         if tcp_header.syn {
@@ -223,7 +221,8 @@ impl TcpConnection {
         }
         // Process the connection when the connection in SynReceived status
 
-        let mut tcb = tbc.lock().await;
+        let tcb_send_to_relay = tcb.clone();
+        let mut tcb = tcb.lock().await;
         if tcp_header.acknowledgment_number != tcb.sequence_number + 1 {
             error!(
                 ">>>> Tcp connection [{id}] fail to process [SynReceived] because of un expected sequence number, {}",
@@ -244,17 +243,18 @@ impl TcpConnection {
         debug!(">>>> Tcp connection [{}] connect to destination success, {}", id, &tcb);
         let (dst_read, dst_write) = dst_tcp_stream.into_split();
 
-        Self::start_dst_relay(
+        let (dst_read_task, dst_write_task) = Self::start_dst_relay(
             id,
             ip_packet_output_sender.clone(),
             dst_read,
             dst_write,
-            tbc.clone(),
+            tcb_send_to_relay,
             dst_read_notify,
             dst_write_notify,
         )
         .await;
-
+        tcb.dst_read_task = Some(dst_read_task);
+        tcb.dst_write_task = Some(dst_write_task);
         tcb.status = TcpConnectionStatus::Established;
 
         tcb.sequence_number += 1;
@@ -266,11 +266,11 @@ impl TcpConnection {
     }
 
     async fn on_established(
-        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, dst_write_notify: Arc<Notify>,
+        id: TcpConnectionId, tcb: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, dst_write_notify: Arc<Notify>,
         tcp_header: TcpHeader, payload: Vec<u8>,
     ) -> Result<()> {
         // Process the connection when the connection in Established status
-        let mut tcb = tbc.lock().await;
+        let mut tcb = tcb.lock().await;
 
         if tcb.sequence_number < tcp_header.acknowledgment_number {
             error!(
@@ -309,6 +309,13 @@ impl TcpConnection {
             )
             .await?;
             tcb.acknowledgment_number = tcp_header.sequence_number + device_data_length as u32;
+            debug!(
+                ">>>> Tcp connection [{id}] have enough rx window size [{}] and success receive device data [size={}] to rx_window, {}, device data:\n{}\n",
+                tcb.rx_window_size,
+                device_data_length,
+                &tcb,
+                pretty_hex::pretty_hex(&payload)
+            );
         } else {
             Self::send_ack_to_device(
                 id,
@@ -319,13 +326,15 @@ impl TcpConnection {
                 tcb.rx_window_size,
             )
             .await?;
+            debug!(
+                ">>>> Tcp connection [{id}] do not have enough rx window size [{}] to receive device data [size={}] to rx_window, {}, device data:\n{}\n",
+                tcb.rx_window_size,
+                device_data_length,
+                &tcb,
+                pretty_hex::pretty_hex(&payload)
+            );
         }
-        debug!(
-            ">>>> Tcp connection [{id}] success relay device data [size={}] to destination, {}, device data:\n{}\n",
-            device_data_length,
-            &tcb,
-            pretty_hex::pretty_hex(&payload)
-        );
+
         dst_write_notify.notify_one();
 
         if tcp_header.fin {
@@ -346,9 +355,9 @@ impl TcpConnection {
     }
 
     async fn on_fin_wait1(
-        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
+        id: TcpConnectionId, tcb: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
-        let mut tcb = tbc.lock().await;
+        let mut tcb = tcb.lock().await;
         if !tcp_header.ack {
             error!(">>>> Tcp connection [{id}] fail to process [FinWait1], expect ack=true, but get: {tcp_header:?}",);
             return Err(anyhow!(
@@ -438,9 +447,9 @@ impl TcpConnection {
     }
 
     async fn on_last_ack(
-        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
+        id: TcpConnectionId, tcb: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
-        let mut tcb = tbc.lock().await;
+        let mut tcb = tcb.lock().await;
         if !tcp_header.ack {
             error!(">>>> Tcp connection [{id}] fail to process [LastAck], expect ack=true, but get: {tcp_header:?}",);
             return Err(anyhow!(
@@ -473,18 +482,18 @@ impl TcpConnection {
     }
 
     async fn on_time_wait(
-        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
+        id: TcpConnectionId, tcb: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
-        let tcb = tbc.lock().await;
+        let tcb = tcb.lock().await;
         Self::send_ack_to_device(id, tcb.sequence_number, tcb.acknowledgment_number, ip_packet_output_sender, None, 0).await?;
         debug!(">>>> Tcp connection [{id}] keep in [TimeWait], current tcb: {tcb:?}");
         Ok(())
     }
 
     async fn on_close_wait(
-        id: TcpConnectionId, tbc: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
+        id: TcpConnectionId, tcb: Arc<Mutex<TransmissionControlBlock>>, ip_packet_output_sender: &Sender<Vec<u8>>, tcp_header: TcpHeader,
     ) -> Result<()> {
-        let mut tcb = tbc.lock().await;
+        let mut tcb = tcb.lock().await;
         debug!(">>>> Tcp connection [{id}] in [CloseWait] status, switch to [LastAck], current tcb: {tcb:?}");
         Self::send_ack_to_device(id, tcb.sequence_number, tcb.acknowledgment_number, ip_packet_output_sender, None, 0).await?;
         tcb.status = TcpConnectionStatus::LastAck;
